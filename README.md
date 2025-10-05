@@ -1,207 +1,115 @@
-# 桌面 Widget 管理器
+# IKWidgetManager - Windows 桌面插件管理器
 
-一個用 C++ 編寫的 Windows 桌面 Widget 管理系統，第一個 Widget 是類似 Stardock Fences 的桌面柵欄工具。
+IKWidgetManager 是一個用 C++ 編寫的現代化 Windows 桌面小工具管理系統，採用 **DLL 插件架構**，使其輕量、靈活且易於擴展。
 
-## 功能特點
+主程序 `DesktopWidgetManager.exe` 負責掃描並加載位於同一目錄下的所有 Widget 插件（`.dll` 檔案），並透過系統托盤圖示提供統一的管理介面。
 
-### Widget 管理器
-- 統一管理多個桌面 Widget
-- 支援動態啟用/停用 Widget
-- 系統托盤控制介面
-- 插件式架構，易於擴展
+![架構圖](https://i.imgur.com/your-architecture-diagram.png)  <!-- 建議未來可以補上架構圖 -->
 
-### Fences 桌面柵欄 Widget
-- 創建透明的桌面柵欄區域
-- 可拖動移動柵欄位置
-- 右下角拖動調整大小
-- 自定義標題和外觀
-- 半透明效果
+## 主要功能
 
-## 項目結構
+### 核心管理器
+- **插件化架構**：每個 Widget 都是一個獨立的 DLL，可獨立開發與部署。
+- **動態加載**：主程序在啟動時自動掃描並加載所有可用的 Widget 插件。
+- **系統托盤控制**：透過系統托盤圖示的右鍵選單，可以啟用/停用各個 Widget，並執行 Widget 提供的自定義命令。
+- **狀態持久化**：自動記錄每個 Widget 的啟用/停用狀態，下次啟動時恢復。
+- **開機自動啟動**：可設定是否隨 Windows 開機啟動。
 
+### FencesWidget (桌面柵欄插件)
+本專案的核心插件，提供類似 Stardock Fences 的桌面圖示整理功能。
+- **創建柵欄**：在桌面上建立半透明的容器來組織桌面圖示。
+- **拖放支持**：可將桌面圖示拖入柵欄，或在柵欄之間移動。
+- **外觀自定義**：可修改柵欄的背景顏色、標題顏色和透明度。
+- **自動分類**：一鍵將桌面上的圖示按「文件、圖片、應用程式」等類別自動整理到對應的柵欄中。
+- **滾動與收合**：當圖示過多時，柵欄支持滾動；也可將柵欄收合，只顯示標題列。
+- **配置持久化**：柵欄的位置、大小、外觀和圖示內容都會自動保存。
+
+### StickyNotesWidget (便利貼插件)
+一個簡單的便利貼範例插件，用於演示插件系統的擴展能力。
+
+## 專案結構
 ```
-Fences_claude/
-├── CMakeLists.txt              # 主 CMake 配置
-├── README.md                   # 本文件
+IKWidgetManager/
 ├── src/
-│   ├── CMakeLists.txt          # 源碼 CMake 配置
-│   ├── main.cpp                # 主程序入口
-│   ├── core/                   # Widget 管理器核心
-│   │   ├── IWidget.h           # Widget 介面定義
-│   │   ├── WidgetManager.h     # Widget 管理器頭文件
-│   │   └── WidgetManager.cpp   # Widget 管理器實現
-│   └── widgets/                # Widget 實現
-│       ├── FencesWidget.h      # Fences Widget 頭文件
-│       └── FencesWidget.cpp    # Fences Widget 實現
-└── build/                      # 編譯輸出目錄（自動生成）
+│   ├── main.cpp                    # 應用程式入口點，系統托盤管理
+│   ├── core/
+│   │   ├── IWidget.h               # Widget 插件介面定義
+│   │   ├── WidgetManager.h/cpp     # Widget 管理器
+│   │   ├── WidgetExport.h          # DLL 導出宏和函數簽名
+│   │   └── PluginLoader.h/cpp      # 插件動態加載器
+│   └── widgets/
+│       ├── FencesWidget.h/cpp      # FencesWidget 插件實現
+│       └── StickyNotesWidget.h/cpp # StickyNotesWidget 插件實現
+├── build/                          # CMake 構建目錄
+│   └── bin/Release/
+│       ├── DesktopWidgetManager.exe    # 主程序
+│       ├── FencesWidget.dll            # FencesWidget 插件
+│       └── StickyNotesWidget.dll       # 便利貼插件
+└── README.md                       # 本文檔
 ```
 
-## 編譯要求
+## 編譯與執行
 
-### 系統要求
+### 環境要求
 - Windows 10 或更高版本
-- Visual Studio 2019 或更高版本（推薦使用 MSVC 編譯器）
+- Visual Studio 2022 (MSVC C++17)
 - CMake 3.15 或更高版本
 
-### 依賴項
-- Windows SDK（包含在 Visual Studio 中）
-- C++17 標準庫
-
-## 編譯步驟
-
-### 使用 CMake GUI
-
-1. 打開 CMake GUI
-2. 設置 "Where is the source code" 為項目根目錄
-3. 設置 "Where to build the binaries" 為 `build` 目錄
-4. 點擊 "Configure"，選擇 Visual Studio 生成器
-5. 點擊 "Generate"
-6. 點擊 "Open Project" 打開 Visual Studio
-7. 在 Visual Studio 中按 F7 編譯
-
-### 使用命令行
-
+### 編譯步驟 (命令行)
 ```bash
-# 創建編譯目錄
+# 1. 創建構建目錄
 mkdir build
 cd build
 
-# 配置 CMake（使用 Visual Studio 2019）
-cmake .. -G "Visual Studio 16 2019" -A x64
+# 2. 使用 CMake 生成 Visual Studio 專案
+#    請確保您的環境中 Visual Studio 2022 的生成器是可用的
+cmake -G "Visual Studio 17 2022" ..
 
-# 編譯（Release 版本）
+# 3. 編譯 Release 版本
 cmake --build . --config Release
-
-# 或者編譯 Debug 版本
-cmake --build . --config Debug
 ```
 
-### 使用 Visual Studio Developer Command Prompt
-
-```bash
-# 創建編譯目錄
-mkdir build
-cd build
-
-# 配置並編譯
-cmake .. -G "Visual Studio 16 2019" -A x64
-msbuild DesktopWidgetManager.sln /p:Configuration=Release
+### 執行
+編譯完成後，所有必要的檔案都會在 `build/bin/Release/` 目錄下。
 ```
-
-## 運行程序
-
-編譯完成後，可執行文件位於：
+build/bin/Release/
+├── DesktopWidgetManager.exe    # 雙擊運行此主程序
+├── FencesWidget.dll
+└── StickyNotesWidget.dll
 ```
-build/bin/Release/DesktopWidgetManager.exe
-```
+**重要提示**：請確保所有 `.dll` 插件檔案與 `.exe` 主程序位於同一目錄下，否則插件將無法被加載。
 
-或者 Debug 版本：
-```
-build/bin/Debug/DesktopWidgetManager.exe
-```
+## 如何擴展開發：創建新的 Widget
 
-雙擊運行即可。
+得益於插件化架構，您可以輕鬆創建自己的 Widget：
 
-## 使用說明
+1. **創建 Widget 類**：在 `src/widgets/` 目錄下，創建一個新類並繼承自 `IWidget` 介面。
+2. **實現介面方法**：實現 `Start()`, `Stop()` 等虛函數。
+3. **導出 C 接口**：在您的 Widget cpp 檔案中，導出 `CreateWidget`, `DestroyWidget` 等 C 風格的函數，作為 DLL 的入口點。
+4. **更新 CMakeLists.txt**：在 `src/CMakeLists.txt` 中，為您的新 Widget 添加一個 `add_library` 規則，將其編譯為 `SHARED` 庫 (DLL)。
+5. **編譯**：重新編譯專案，新的 `.dll` 檔案將會生成。將它和主程序放在一起即可被自動加載。
 
-### 啟動程序
+詳細的接口定義和導出宏請參考 `src/core/WidgetExport.h`。
 
-1. 運行 `DesktopWidgetManager.exe`
-2. 程序會在系統托盤顯示圖標
-3. 默認會啟動一個桌面柵欄
+## 更新日誌
 
-### 控制 Widget
+### 版本 2.0 (2025-10-04) - 插件化架構
+- **重大變更**：重構為 DLL 插件架構，主程序與 Widget 完全解耦。
+- **新功能**：
+    - `FencesWidget` 新增「自動分類桌面圖示」功能。
+    - `FencesWidget` 新增「清除所有資料」功能。
+    - 系統托盤選單支持子選單，可執行 Widget 的自定義命令。
+    - 新增 `StickyNotesWidget` 作為第二個插件範例。
+- **修復**：
+    - 修復了停用再啟用 Widget 時會出現重複項的問題。
+    - 修復了 Widget 啟用狀態無法保存的問題。
+    - 修復了刪除柵欄後，配置文件未同步更新的問題。
+- **優化**：
+    - 停用 Widget 時保留其數據，再次啟用時可立即恢復，無需重新加載。
 
-- **右鍵點擊托盤圖標**：打開控制菜單
-- **切換 Widget**：點擊菜單中的 "桌面柵欄 Widget" 來啟用/停用
-- **退出程序**：選擇 "退出"
+### 版本 1.0
+- 基礎 `FencesWidget` 功能實現。
+- 單體應用程式結構。
 
-### 操作桌面柵欄
-
-- **移動柵欄**：在柵欄任意位置按住左鍵拖動
-- **調整大小**：拖動柵欄右下角的灰色區域
-- **最小尺寸**：100x100 像素
-
-## 架構設計
-
-### 核心組件
-
-#### IWidget 介面
-所有 Widget 必須實現的介面，定義了基本的生命週期方法：
-- `Initialize()`: 初始化 Widget
-- `Start()`: 啟動 Widget
-- `Stop()`: 停止 Widget
-- `Shutdown()`: 清理資源
-
-#### WidgetManager
-單例模式的管理器，負責：
-- Widget 註冊和反註冊
-- Widget 生命週期管理
-- 啟用/停用控制
-- 線程安全操作
-
-#### FencesWidget
-實現桌面柵欄功能：
-- 使用分層窗口（Layered Window）實現半透明效果
-- 雙緩衝繪圖避免閃爍
-- 支持拖動和調整大小
-- 可擴展的柵欄管理
-
-## 擴展開發
-
-### 創建新的 Widget
-
-1. 創建新的類繼承 `IWidget`
-2. 實現所有虛函數
-3. 在 `src/widgets/` 目錄下添加源文件
-4. 修改 `src/CMakeLists.txt` 添加新的庫
-5. 在 `main.cpp` 中註冊新 Widget
-
-示例：
-```cpp
-class MyWidget : public IWidget {
-public:
-    bool Initialize() override {
-        // 初始化代碼
-        return true;
-    }
-
-    bool Start() override {
-        // 啟動代碼
-        return true;
-    }
-
-    void Stop() override {
-        // 停止代碼
-    }
-
-    void Shutdown() override {
-        // 清理代碼
-    }
-
-    // ... 實現其他方法
-};
-```
-
-## 已知限制
-
-1. 目前僅支持 Windows 平台
-2. 柵欄不會自動捕獲桌面圖標（需要手動移動圖標）
-3. 柵欄配置不會持久化（重啟後恢復默認）
-
-## 未來計劃
-
-- [ ] 添加柵欄配置保存/加載功能
-- [ ] 實現桌面圖標自動整理到柵欄
-- [ ] 添加更多自定義選項（顏色、透明度等）
-- [ ] 實現多柵欄管理 UI
-- [ ] 添加更多 Widget（時鐘、天氣、系統監控等）
-- [ ] 支持 Widget 熱重載
-
-## 許可證
-
-本項目僅供學習和研究使用。
-
-## 作者
-
-由 Claude 協助開發
+## 授權
+本專案為開源學習範例，您可以自由修改、使用和分發。
