@@ -1,0 +1,49 @@
+
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    name: Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up MSVC
+        uses: microsoft/setup-msvc-dev@v1
+
+      - name: Create build directory
+        run: mkdir build
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          cd build
+          cmake .. -G "Visual Studio 17 2022"
+
+      - name: Build with CMake
+        shell: cmd
+        run: |
+          cd build
+          cmake --build . --config Release
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          mkdir release_package
+          copy build\bin\Release\*.exe release_package
+          copy build\bin\Release\*.dll release_package
+          Compress-Archive -Path release_package\* -DestinationPath IKWidgetManager-${{ github.ref_name }}.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: IKWidgetManager-${{ github.ref_name }}.zip
+          body: |
+            Release for version ${{ github.ref_name }}
