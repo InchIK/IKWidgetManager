@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where cmake)",
+      "Bash(cmake:*)",
+      "Bash(taskkill:*)",
+      "Bash(dir \"%APPDATA%\\FencesWidget\")",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Read(//e/**)",
+      "Bash(cmd /c:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

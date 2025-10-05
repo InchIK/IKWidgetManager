@@ -1,0 +1,413 @@
+#include "FencesWidget.h"
+#include <windows.h>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+
+// Macros from windowsx.h
+#ifndef GET_X_LPARAM
+#define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
+#endif
+#ifndef GET_Y_LPARAM
+#define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
+#endif
+
+FencesWidget::FencesWidget()
+    : running_(false)
+    , hInstance_(GetModuleHandle(nullptr))
+    , windowClassName_(L"DesktopFenceWidget")
+    , classRegistered_(false) {
+}
+
+FencesWidget::~FencesWidget() {
+    Shutdown();
+}
+
+bool FencesWidget::Initialize() {
+    if (classRegistered_) {
+        return true;
+    }
+
+    return RegisterWindowClass();
+}
+
+bool FencesWidget::Start() {
+    if (running_) {
+        return true;
+    }
+
+    // Create a demo fence
+    if (!CreateFence(100, 100, 300, 400, L"Desktop Fence 1")) {
+        return false;
+    }
+
+    running_ = true;
+    return true;
+}
+
+void FencesWidget::Stop() {
+    if (!running_) {
+        return;
+    }
+
+    // Hide all fence windows
+    for (auto& fence : fences_) {
+        if (fence.hwnd) {
+            ShowWindow(fence.hwnd, SW_HIDE);
+        }
+    }
+
+    running_ = false;
+}
+
+void FencesWidget::Shutdown() {
+    Stop();
+
+    // Destroy all fence windows
+    for (auto& fence : fences_) {
+        if (fence.hwnd) {
+            DestroyWindow(fence.hwnd);
+            fence.hwnd = nullptr;
+        }
+    }
+
+    fences_.clear();
+    UnregisterWindowClass();
+}
+
+std::wstring FencesWidget::GetName() const {
+    return L"FencesWidget";
+}
+
+std::wstring FencesWidget::GetDescription() const {
+    return L"桌面柵欄工具 - 類似 Stardock Fences 的桌面圖標管理器";
+}
+
+bool FencesWidget::IsRunning() const {
+    return running_;
+}
+
+std::wstring FencesWidget::GetWidgetVersion() const {
+    return L"1.0.0";
+}
+
+bool FencesWidget::CreateFence(int x, int y, int width, int height, const std::wstring& title) {
+    if (!classRegistered_) {
+        return false;
+    }
+
+    // Create layered window (transparent window)
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        windowClassName_,
+        title.c_str(),
+        WS_POPUP,
+        x, y, width, height,
+        nullptr,
+        nullptr,
+        hInstance_,
+        this
+    );
+
+    if (!hwnd) {
+        return false;
+    }
+
+    // Set transparency
+    SetLayeredWindowAttributes(hwnd, 0, 200, LWA_ALPHA);
+
+    Fence fence;
+    fence.hwnd = hwnd;
+    fence.rect = { x, y, x + width, y + height };
+    fence.title = title;
+    fence.backgroundColor = RGB(240, 240, 240);
+    fence.borderColor = RGB(100, 100, 100);
+    fence.borderWidth = 2;
+    fence.isResizing = false;
+    fence.isDragging = false;
+    fence.dragOffset = { 0, 0 };
+
+    fences_.push_back(fence);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    return true;
+}
+
+bool FencesWidget::RemoveFence(size_t index) {
+    if (index >= fences_.size()) {
+        return false;
+    }
+
+    if (fences_[index].hwnd) {
+        DestroyWindow(fences_[index].hwnd);
+    }
+
+    fences_.erase(fences_.begin() + index);
+    return true;
+}
+
+size_t FencesWidget::GetFenceCount() const {
+    return fences_.size();
+}
+
+bool FencesWidget::RegisterWindowClass() {
+    WNDCLASSEXW wcex = { 0 };
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WindowProc;
+    wcex.cbClsExtra = 0;
+    wcex.cbWndExtra = sizeof(FencesWidget*);
+    wcex.hInstance = hInstance_;
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = nullptr;
+    wcex.lpszClassName = windowClassName_;
+
+    if (!RegisterClassExW(&wcex)) {
+        return false;
+    }
+
+    classRegistered_ = true;
+    return true;
+}
+
+void FencesWidget::UnregisterWindowClass() {
+    if (classRegistered_) {
+        UnregisterClassW(windowClassName_, hInstance_);
+        classRegistered_ = false;
+    }
+}
+
+LRESULT CALLBACK FencesWidget::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    FencesWidget* widget = nullptr;
+
+    if (msg == WM_CREATE) {
+        CREATESTRUCT* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
+        widget = static_cast<FencesWidget*>(cs->lpCreateParams);
+        SetWindowLongPtr(hwnd, 0, reinterpret_cast<LONG_PTR>(widget));
+    } else {
+        widget = reinterpret_cast<FencesWidget*>(GetWindowLongPtr(hwnd, 0));
+    }
+
+    if (widget) {
+        return widget->HandleMessage(hwnd, msg, wParam, lParam);
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+LRESULT FencesWidget::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    Fence* fence = FindFence(hwnd);
+
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        PaintFence(hwnd, hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        if (fence) {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            OnLButtonDown(fence, x, y);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (fence) {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            OnMouseMove(fence, x, y);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (fence) {
+            OnLButtonUp(fence);
+        }
+        return 0;
+    }
+
+    case WM_SETCURSOR: {
+        if (fence) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+
+            RECT clientRect;
+            GetClientRect(hwnd, &clientRect);
+
+            if (IsInResizeArea(clientRect, pt.x, pt.y)) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZENWSE));
+                return TRUE;
+            }
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        return 0;
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void FencesWidget::PaintFence(HWND hwnd, HDC hdc) {
+    Fence* fence = FindFence(hwnd);
+    if (!fence) {
+        return;
+    }
+
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+
+    // Create memory DC for double buffering
+    HDC memDC = CreateCompatibleDC(hdc);
+    HBITMAP memBitmap = CreateCompatibleBitmap(hdc,
+        clientRect.right - clientRect.left,
+        clientRect.bottom - clientRect.top);
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+    // Fill background
+    HBRUSH bgBrush = CreateSolidBrush(fence->backgroundColor);
+    FillRect(memDC, &clientRect, bgBrush);
+    DeleteObject(bgBrush);
+
+    // Draw border
+    HPEN borderPen = CreatePen(PS_SOLID, fence->borderWidth, fence->borderColor);
+    HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
+
+    Rectangle(memDC,
+        clientRect.left,
+        clientRect.top,
+        clientRect.right,
+        clientRect.bottom);
+
+    SelectObject(memDC, oldBrush);
+    SelectObject(memDC, oldPen);
+    DeleteObject(borderPen);
+
+    // Draw title
+    if (!fence->title.empty()) {
+        RECT titleRect = clientRect;
+        titleRect.top += 10;
+        titleRect.left += 10;
+        titleRect.right -= 10;
+        titleRect.bottom = titleRect.top + 30;
+
+        SetBkMode(memDC, TRANSPARENT);
+        SetTextColor(memDC, RGB(0, 0, 0));
+
+        HFONT hFont = CreateFontW(
+            18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        HFONT oldFont = (HFONT)SelectObject(memDC, hFont);
+        DrawTextW(memDC, fence->title.c_str(), -1, &titleRect,
+            DT_LEFT | DT_TOP | DT_SINGLELINE);
+        SelectObject(memDC, oldFont);
+        DeleteObject(hFont);
+    }
+
+    // Draw resize indicator
+    HBRUSH resizeIndicatorBrush = CreateSolidBrush(RGB(150, 150, 150));
+    RECT resizeRect = {
+        clientRect.right - 15,
+        clientRect.bottom - 15,
+        clientRect.right - 5,
+        clientRect.bottom - 5
+    };
+    FillRect(memDC, &resizeRect, resizeIndicatorBrush);
+    DeleteObject(resizeIndicatorBrush);
+
+    // Copy to screen
+    BitBlt(hdc, 0, 0,
+        clientRect.right - clientRect.left,
+        clientRect.bottom - clientRect.top,
+        memDC, 0, 0, SRCCOPY);
+
+    SelectObject(memDC, oldBitmap);
+    DeleteObject(memBitmap);
+    DeleteDC(memDC);
+}
+
+Fence* FencesWidget::FindFence(HWND hwnd) {
+    for (auto& fence : fences_) {
+        if (fence.hwnd == hwnd) {
+            return &fence;
+        }
+    }
+    return nullptr;
+}
+
+void FencesWidget::OnLButtonDown(Fence* fence, int x, int y) {
+    RECT clientRect;
+    GetClientRect(fence->hwnd, &clientRect);
+
+    if (IsInResizeArea(clientRect, x, y)) {
+        fence->isResizing = true;
+        SetCapture(fence->hwnd);
+    } else {
+        fence->isDragging = true;
+        fence->dragOffset.x = x;
+        fence->dragOffset.y = y;
+        SetCapture(fence->hwnd);
+    }
+}
+
+void FencesWidget::OnMouseMove(Fence* fence, int x, int y) {
+    if (fence->isResizing) {
+        RECT rect;
+        GetWindowRect(fence->hwnd, &rect);
+
+        int newWidth = x;
+        int newHeight = y;
+
+        if (newWidth < 100) newWidth = 100;
+        if (newHeight < 100) newHeight = 100;
+
+        SetWindowPos(fence->hwnd, nullptr, 0, 0, newWidth, newHeight,
+            SWP_NOMOVE | SWP_NOZORDER);
+
+        fence->rect.right = fence->rect.left + newWidth;
+        fence->rect.bottom = fence->rect.top + newHeight;
+    } else if (fence->isDragging) {
+        POINT pt;
+        GetCursorPos(&pt);
+
+        int newX = pt.x - fence->dragOffset.x;
+        int newY = pt.y - fence->dragOffset.y;
+
+        RECT rect;
+        GetWindowRect(fence->hwnd, &rect);
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+
+        SetWindowPos(fence->hwnd, nullptr, newX, newY, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER);
+
+        fence->rect.left = newX;
+        fence->rect.top = newY;
+        fence->rect.right = newX + width;
+        fence->rect.bottom = newY + height;
+    }
+}
+
+void FencesWidget::OnLButtonUp(Fence* fence) {
+    fence->isResizing = false;
+    fence->isDragging = false;
+    ReleaseCapture();
+}
+
+bool FencesWidget::IsInResizeArea(const RECT& rect, int x, int y) const {
+    const int resizeMargin = 15;
+    return (x >= rect.right - resizeMargin && y >= rect.bottom - resizeMargin);
+}
