@@ -21,6 +21,12 @@ endif()
 add_library(FencesWidget SHARED
     widgets/FencesWidget.h
     widgets/FencesWidget.cpp
+    widgets/ShellIntegration.h
+    widgets/ShellIntegration.cpp
+    widgets/DropTarget.h
+    widgets/DropTarget.cpp
+    widgets/FileManager.h
+    widgets/FileManager.cpp
 )
 
 target_link_libraries(FencesWidget PRIVATE

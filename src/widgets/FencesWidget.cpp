@@ -1,4 +1,6 @@
 #include "FencesWidget.h"
+#include "ShellIntegration.h"
+#include "DropTarget.h"
 #include "core/WidgetExport.h"
 #include <windows.h>
 #include <shellapi.h>
@@ -70,8 +72,13 @@ FencesWidget::FencesWidget()
     , classRegistered_(false)
     , desktopWindow_(nullptr)
     , desktopListView_(nullptr)
+    , desktopShellView_(nullptr)
+    , originalShellViewProc_(nullptr)
     , selectedIconIndex_(-1)
-    , selectedFence_(nullptr) {
+    , selectedFence_(nullptr)
+    , shellNotifyListener_(nullptr)
+    , desktopEnumerator_(nullptr)
+    , fileManager_(nullptr) {
 }
 
 FencesWidget::~FencesWidget() {
@@ -79,12 +86,63 @@ FencesWidget::~FencesWidget() {
 }
 
 bool FencesWidget::Initialize() {
+    OutputDebugStringW(L"========================================\n");
+    OutputDebugStringW(L"[FencesWidget] Initialize() START\n");
+    OutputDebugStringW(L"========================================\n");
+
     if (classRegistered_) {
+        OutputDebugStringW(L"[FencesWidget] Already registered, returning true\n");
         return true;
     }
 
+    // =========================================================================
+    // NEW in v3.1: Initialize OLE for IDropTarget support
+    // =========================================================================
+    HRESULT hr = OleInitialize(nullptr);
+    if (FAILED(hr) && hr != S_FALSE) {
+        OutputDebugStringW(L"[FencesWidget] Failed to initialize OLE\n");
+        return false;
+    }
+    OutputDebugStringW(L"[FencesWidget] OLE initialized for drag-drop support\n");
+
+    // =========================================================================
+    // NEW in v4.0: Initialize FileManager for safe file operations
+    // =========================================================================
+    fileManager_ = new FileManager();
+    if (!fileManager_->Initialize()) {
+        OutputDebugStringW(L"[FencesWidget] Failed to initialize FileManager\n");
+        delete fileManager_;
+        fileManager_ = nullptr;
+        return false;
+    }
+    OutputDebugStringW(L"[FencesWidget] FileManager initialized successfully\n");
+
     desktopWindow_ = GetDesktopWindow();
-    return RegisterWindowClass();
+
+    // Initialize desktop enumerator
+    desktopEnumerator_ = new DesktopEnumerator();
+    if (!desktopEnumerator_->Initialize()) {
+        delete desktopEnumerator_;
+        desktopEnumerator_ = nullptr;
+        return false;
+    }
+
+    // Setup desktop ListView subclass for Custom Draw
+    OutputDebugStringW(L"[FencesWidget] Attempting to setup desktop subclass...\n");
+    if (!SetupDesktopSubclass()) {
+        // Non-fatal: fall back to old method if subclass fails
+        OutputDebugStringW(L"[FencesWidget] ERROR: Failed to setup desktop subclass - Custom Draw will NOT work!\n");
+    } else {
+        OutputDebugStringW(L"[FencesWidget] SUCCESS: Desktop subclass setup complete\n");
+    }
+
+    bool result = RegisterWindowClass();
+    if (result) {
+        OutputDebugStringW(L"[FencesWidget] Initialize() completed successfully\n");
+    } else {
+        OutputDebugStringW(L"[FencesWidget] Initialize() FAILED at RegisterWindowClass\n");
+    }
+    return result;
 }
 
 bool FencesWidget::Start() {
@@ -116,15 +174,20 @@ bool FencesWidget::Start() {
         }
     }
 
-    // 重新隱藏應該在柵欄中的桌面圖示
+    // =========================================================================
+    // NEW in v3.0: Rebuild managedIconPaths and trigger desktop redraw
+    // =========================================================================
+    managedIconPaths_.clear();
     for (auto& fence : fences_) {
-        if (!fence.icons.empty()) {
-            std::vector<std::wstring> iconPaths;
-            for (const auto& icon : fence.icons) {
-                iconPaths.push_back(icon.filePath);
-            }
-            HideDesktopIconsBatch(iconPaths);
+        for (const auto& icon : fence.icons) {
+            managedIconPaths_.insert(icon.filePath);
         }
+    }
+
+    // Trigger desktop ListView redraw to apply Custom Draw suppression
+    if (desktopListView_) {
+        InvalidateRect(desktopListView_, nullptr, TRUE);
+        OutputDebugStringW(L"[FencesWidget] Desktop redraw triggered for Custom Draw\n");
     }
 
     running_ = true;
@@ -132,18 +195,15 @@ bool FencesWidget::Start() {
 }
 
 void FencesWidget::RestoreAllDesktopIcons() {
-    // 收集所有需要恢復的圖示資料
-    std::vector<std::pair<std::wstring, POINT>> iconData;
+    // =========================================================================
+    // NEW in v3.0: Simply clear managedIconPaths and trigger desktop redraw
+    // Icons never left Desktop folder, so they will automatically reappear
+    // =========================================================================
+    managedIconPaths_.clear();
 
-    for (auto& fence : fences_) {
-        for (const auto& icon : fence.icons) {
-            iconData.push_back({icon.filePath, icon.originalDesktopPos});
-        }
-    }
-
-    // 批次恢復所有圖示（一次性完成，避免多次重繪）
-    if (!iconData.empty()) {
-        RestoreDesktopIconsBatch(iconData);
+    if (desktopListView_) {
+        InvalidateRect(desktopListView_, nullptr, TRUE);
+        OutputDebugStringW(L"[FencesWidget] All icons restored via Custom Draw\n");
     }
 }
 
@@ -303,16 +363,9 @@ void FencesWidget::AutoCategorizeDesktopIcons() {
 
         // 將檔案加入到柵欄
         if (targetFence) {
-            std::vector<std::wstring> filesToHide;
             for (const auto& filePath : files) {
-                if (AddIconToFence(targetFence, filePath)) {
-                    filesToHide.push_back(filePath);
-                }
-            }
-
-            // 批次隱藏桌面圖示
-            if (!filesToHide.empty()) {
-                HideDesktopIconsBatch(filesToHide);
+                AddIconToFence(targetFence, filePath);
+                // AddIconToFence now handles managedIconPaths and desktop redraw
             }
 
             ArrangeIcons(targetFence);
@@ -422,10 +475,7 @@ bool FencesWidget::SaveConfiguration(const std::wstring& filePath) {
         for (size_t j = 0; j < fence.icons.size(); ++j) {
             const auto& icon = fence.icons[j];
             config += L"        {\n";
-            config += L"          \"filePath\": \"" + icon.filePath + L"\",\n";
-            config += L"          \"originalX\": " + std::to_wstring(icon.originalDesktopPos.x) + L",\n";
-            config += L"          \"originalY\": " + std::to_wstring(icon.originalDesktopPos.y) + L",\n";
-            config += L"          \"originalIndex\": " + std::to_wstring(icon.originalDesktopIndex) + L"\n";
+            config += L"          \"filePath\": \"" + icon.filePath + L"\"\n";
             config += L"        }";
             if (j < fence.icons.size() - 1) config += L",";
             config += L"\n";
@@ -599,16 +649,7 @@ bool FencesWidget::LoadConfiguration(const std::wstring& filePath) {
                 size_t pathEnd = json.find(L'"', pathStart);
                 std::wstring iconPath = json.substr(pathStart, pathEnd - pathStart);
 
-                // 解析原始位置
-                size_t oxPos = json.find(L"\"originalX\":", pathEnd);
-                size_t oyPos = json.find(L"\"originalY\":", oxPos);
-                size_t oiPos = json.find(L"\"originalIndex\":", oyPos);
-
-                int origX = std::stoi(json.substr(json.find(L':', oxPos) + 1, 10));
-                int origY = std::stoi(json.substr(json.find(L':', oyPos) + 1, 10));
-                int origIndex = std::stoi(json.substr(json.find(L':', oiPos) + 1, 10));
-
-                // 添加圖示到柵欄（不會自動記錄位置，因為已有配置）
+                // 添加圖示到柵欄
                 DesktopIcon newIcon;
                 newIcon.filePath = iconPath;
 
@@ -630,8 +671,6 @@ bool FencesWidget::LoadConfiguration(const std::wstring& filePath) {
 
                 newIcon.selected = false;
                 newIcon.position = { 0, 0 };
-                newIcon.originalDesktopPos = { origX, origY };
-                newIcon.originalDesktopIndex = origIndex;
 
                 // 提取顯示名稱
                 size_t lastSlash = iconPath.find_last_of(L"\\/");
@@ -648,16 +687,14 @@ bool FencesWidget::LoadConfiguration(const std::wstring& filePath) {
 
                 fence->icons.push_back(newIcon);
 
-                // 記錄需要隱藏的圖示路徑
-                iconPathsToHide.push_back(iconPath);
-
                 iconPos = pathEnd;
             }
 
-            // 批次隱藏所有桌面圖示（一次性完成，避免多次重繪）
-            if (!iconPathsToHide.empty()) {
-                HideDesktopIconsBatch(iconPathsToHide);
-            }
+            // =====================================================================
+            // NEW in v3.0: No longer hide icons, managedIconPaths will be built
+            // in Start() method after all fences are loaded
+            // =====================================================================
+            // Icons will be suppressed via Custom Draw when Start() is called
 
             // 排列圖示
             ArrangeIcons(fence);
@@ -690,12 +727,67 @@ void FencesWidget::Shutdown() {
         SaveConfiguration(configPath);
     }
 
-    // WidgetManager 已經調用過 Stop()，這裡不需要再調用
+    // NEW in v3.0: Remove desktop subclass
+    RemoveDesktopSubclass();
+
+    // NEW in v3.0: Clean up shell notification listener
+    if (shellNotifyListener_) {
+        delete shellNotifyListener_;
+        shellNotifyListener_ = nullptr;
+    }
+
+    // NEW in v3.0: Clean up desktop enumerator
+    if (desktopEnumerator_) {
+        delete desktopEnumerator_;
+        desktopEnumerator_ = nullptr;
+    }
+
+    // NEW in v4.0: Move all managed files back to desktop before shutdown
+    if (fileManager_) {
+        for (auto& fence : fences_) {
+            for (const auto& icon : fence.icons) {
+                if (fileManager_->IsManagedFile(icon.filePath)) {
+                    MoveResult result = fileManager_->MoveBackToDesktop(icon.filePath);
+                    if (result.success) {
+                        wchar_t msg[512];
+                        swprintf_s(msg, L"[FencesWidget] Shutdown: File restored to desktop: %s\n", result.newPath.c_str());
+                        OutputDebugStringW(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // NEW in v4.0: Clean up file manager
+    if (fileManager_) {
+        fileManager_->Shutdown();
+        delete fileManager_;
+        fileManager_ = nullptr;
+        OutputDebugStringW(L"[FencesWidget] FileManager shutdown complete\n");
+    }
+
+    // NEW in v3.0: Clear managed icon paths and force desktop refresh
+    managedIconPaths_.clear();
+    if (desktopListView_) {
+        InvalidateRect(desktopListView_, nullptr, TRUE);
+    }
 
     // Clean up all fence windows and icons
     for (auto& fence : fences_) {
         // Clean up all icon handles
         for (auto& icon : fence.icons) {
+            if (icon.hIcon32) {
+                DestroyIcon(icon.hIcon32);
+                icon.hIcon32 = nullptr;
+            }
+            if (icon.hIcon48) {
+                DestroyIcon(icon.hIcon48);
+                icon.hIcon48 = nullptr;
+            }
+            if (icon.hIcon64) {
+                DestroyIcon(icon.hIcon64);
+                icon.hIcon64 = nullptr;
+            }
             if (icon.hIcon) {
                 DestroyIcon(icon.hIcon);
                 icon.hIcon = nullptr;
@@ -710,6 +802,14 @@ void FencesWidget::Shutdown() {
 
     fences_.clear();
     UnregisterWindowClass();
+
+    // =========================================================================
+    // NEW in v3.1: Uninitialize OLE
+    // =========================================================================
+    OleUninitialize();
+    OutputDebugStringW(L"[FencesWidget] OLE uninitialized\n");
+
+    OutputDebugStringW(L"[FencesWidget] Shutdown completed\n");
 }
 
 std::wstring FencesWidget::GetName() const {
@@ -751,9 +851,6 @@ bool FencesWidget::CreateFence(int x, int y, int width, int height, const std::w
         return false;
     }
 
-    // Enable drag-drop
-    DragAcceptFiles(hwnd, TRUE);
-
     // Set transparency
     SetLayeredWindowAttributes(hwnd, 0, 220, LWA_ALPHA);
 
@@ -790,8 +887,24 @@ bool FencesWidget::CreateFence(int x, int y, int width, int height, const std::w
     fence.isDraggingScrollbar = false;
     fence.scrollbarDragStartY = 0;
     fence.scrollOffsetAtDragStart = 0;
+    fence.pDropTarget = nullptr;
 
     fences_.push_back(fence);
+
+    // =========================================================================
+    // NEW in v3.1: Register IDropTarget for proper drag-and-drop support
+    // This replaces DragAcceptFiles which only supports COPY operations
+    // =========================================================================
+    Fence* pFence = &fences_.back();
+    pFence->pDropTarget = new FenceDropTarget(this, pFence);
+    HRESULT hr = RegisterDragDrop(hwnd, pFence->pDropTarget);
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[FencesWidget] Failed to register IDropTarget\n");
+        pFence->pDropTarget->Release();
+        pFence->pDropTarget = nullptr;
+    } else {
+        OutputDebugStringW(L"[FencesWidget] Successfully registered IDropTarget\n");
+    }
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
@@ -804,15 +917,40 @@ bool FencesWidget::RemoveFence(size_t index) {
         return false;
     }
 
-    // 收集此柵欄內所有需要恢復的圖示資料
-    std::vector<std::pair<std::wstring, POINT>> iconData;
-    for (const auto& icon : fences_[index].icons) {
-        iconData.push_back({icon.filePath, icon.originalDesktopPos});
+    // =========================================================================
+    // NEW in v3.1: Revoke IDropTarget registration
+    // =========================================================================
+    if (fences_[index].pDropTarget) {
+        RevokeDragDrop(fences_[index].hwnd);
+        fences_[index].pDropTarget->Release();
+        fences_[index].pDropTarget = nullptr;
     }
 
-    // 批次恢復所有圖示到桌面（一次性完成，避免多次重繪）
-    if (!iconData.empty()) {
-        RestoreDesktopIconsBatch(iconData);
+    // =========================================================================
+    // NEW in v4.0: Move files back to desktop when removing fence
+    // =========================================================================
+    for (const auto& icon : fences_[index].icons) {
+        managedIconPaths_.erase(icon.filePath);
+
+        // 如果是管理的文件，移回桌面
+        if (fileManager_ && fileManager_->IsManagedFile(icon.filePath)) {
+            MoveResult result = fileManager_->MoveBackToDesktop(icon.filePath);
+            if (result.success) {
+                wchar_t msg[512];
+                swprintf_s(msg, L"[FencesWidget] File restored to desktop: %s\n", result.newPath.c_str());
+                OutputDebugStringW(msg);
+            } else {
+                wchar_t msg[512];
+                swprintf_s(msg, L"[FencesWidget] Failed to restore file: %s (Error: %s)\n",
+                          icon.filePath.c_str(), result.errorMessage.c_str());
+                OutputDebugStringW(msg);
+            }
+        }
+    }
+
+    // Trigger desktop redraw to show icons again
+    if (desktopListView_) {
+        InvalidateRect(desktopListView_, nullptr, TRUE);
     }
 
     // Clean up icon handles
@@ -985,14 +1123,11 @@ LRESULT FencesWidget::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
 
-    case WM_DROPFILES: {
-        if (fence) {
-            HDROP hDrop = (HDROP)wParam;
-            OnDropFiles(fence, hDrop);
-            DragFinish(hDrop);
-        }
-        return 0;
-    }
+    // =========================================================================
+    // NOTE: WM_DROPFILES removed in v3.1
+    // Now using IDropTarget interface for proper MOVE/COPY semantics
+    // See DropTarget.h/cpp for implementation
+    // =========================================================================
 
     case WM_SETCURSOR: {
         if (LOWORD(lParam) == HTCLIENT && fence) {
@@ -2266,22 +2401,12 @@ void FencesWidget::OnLButtonUp(Fence* fence) {
             // 圖示被拖出柵欄 - 恢復到桌面並設定位置
             std::wstring filePath = fence->icons[fence->draggingIconIndex].filePath;
 
-            // 取得螢幕絕對座標
-            POINT ptScreen;
-            GetCursorPos(&ptScreen);
-
-            // 先從柵欄移除（這會呼叫ShowDesktopIcon）
-            if (fence->icons[fence->draggingIconIndex].hIcon) {
-                DestroyIcon(fence->icons[fence->draggingIconIndex].hIcon);
-            }
-            fence->icons.erase(fence->icons.begin() + fence->draggingIconIndex);
-
-            // 在指定位置顯示桌面圖示
-            ShowDesktopIconAtPosition(filePath, ptScreen.x, ptScreen.y);
-
-            // 重新排列柵欄內的圖示
-            ArrangeIcons(fence);
-            InvalidateRect(fence->hwnd, nullptr, TRUE);
+            // =========================================================================
+            // NEW in v3.0: Remove icon from fence using RemoveIconFromFence
+            // which handles managedIconPaths cleanup
+            // =========================================================================
+            RemoveIconFromFence(fence, fence->draggingIconIndex);
+            OutputDebugStringW((L"[FencesWidget] Dragged icon out of fence: " + filePath + L"\n").c_str());
         }
 
         fence->isDraggingIcon = false;
@@ -2310,23 +2435,11 @@ void FencesWidget::OnRButtonDown(Fence* fence, int x, int y) {
     }
 }
 
-void FencesWidget::OnDropFiles(Fence* fence, HDROP hDrop) {
-    UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-
-    for (UINT i = 0; i < fileCount; ++i) {
-        wchar_t filePath[MAX_PATH];
-        if (DragQueryFileW(hDrop, i, filePath, MAX_PATH)) {
-            // Add icon to fence
-            if (AddIconToFence(fence, filePath)) {
-                // Hide the desktop icon in real-time
-                HideDesktopIcon(filePath);
-            }
-        }
-    }
-
-    ArrangeIcons(fence);
-    InvalidateRect(fence->hwnd, nullptr, TRUE);
-}
+// ============================================================================
+// NOTE: OnDropFiles removed in v3.1 - replaced by IDropTarget (DropTarget.cpp)
+// Old WM_DROPFILES mechanism only supported COPY operations
+// IDropTarget provides proper MOVE/COPY semantics based on keyboard state
+// ============================================================================
 
 bool FencesWidget::IsInResizeArea(const RECT& rect, int x, int y) const {
     const int resizeMargin = 15;
@@ -2418,15 +2531,6 @@ bool FencesWidget::AddIconToFence(Fence* fence, const std::wstring& filePath) {
     newIcon.selected = false;
     newIcon.position = { 0, 0 }; // Will be set by ArrangeIcons
 
-    // 記錄原始桌面位置和索引
-    int desktopIndex = FindDesktopIconIndex(filePath);
-    newIcon.originalDesktopIndex = desktopIndex;
-    if (desktopIndex >= 0) {
-        newIcon.originalDesktopPos = GetDesktopIconPosition(desktopIndex);
-    } else {
-        newIcon.originalDesktopPos = { -1, -1 };  // 無效位置
-    }
-
     // Extract display name
     size_t lastSlash = filePath.find_last_of(L"\\/");
     if (lastSlash != std::wstring::npos) {
@@ -2442,6 +2546,25 @@ bool FencesWidget::AddIconToFence(Fence* fence, const std::wstring& filePath) {
     }
 
     fence->icons.push_back(newIcon);
+
+    // =========================================================================
+    // NEW in v3.0: Use Custom Draw rendering suppression instead of hiding
+    // =========================================================================
+    // Add to managed icons set (O(1) operation)
+    managedIconPaths_.insert(filePath);
+
+    // Force desktop ListView to redraw (triggers Custom Draw)
+    if (desktopListView_) {
+        InvalidateRect(desktopListView_, nullptr, TRUE);
+    }
+
+    // Rearrange icons in fence
+    ArrangeIcons(fence);
+
+    // Redraw fence window
+    InvalidateRect(fence->hwnd, nullptr, TRUE);
+
+    OutputDebugStringW((L"[FencesWidget] Added icon to fence: " + filePath + L"\n").c_str());
     return true;
 }
 
@@ -2450,11 +2573,7 @@ bool FencesWidget::RemoveIconFromFence(Fence* fence, size_t iconIndex) {
         return false;
     }
 
-    // 恢復圖示到原始桌面位置（使用批次函數以避免重繪問題）
-    const auto& icon = fence->icons[iconIndex];
-    std::vector<std::pair<std::wstring, POINT>> iconData;
-    iconData.push_back({icon.filePath, icon.originalDesktopPos});
-    RestoreDesktopIconsBatch(iconData);
+    std::wstring filePath = fence->icons[iconIndex].filePath;
 
     // 清理所有快取的圖示
     if (fence->icons[iconIndex].hIcon) {
@@ -2471,8 +2590,38 @@ bool FencesWidget::RemoveIconFromFence(Fence* fence, size_t iconIndex) {
     }
 
     fence->icons.erase(fence->icons.begin() + iconIndex);
+
+    // =========================================================================
+    // NEW in v4.0: Move file back to desktop using FileManager
+    // =========================================================================
+    if (fileManager_ && fileManager_->IsManagedFile(filePath)) {
+        OutputDebugStringW((L"[FencesWidget] Moving file back to desktop: " + filePath + L"\n").c_str());
+
+        MoveResult result = fileManager_->MoveBackToDesktop(filePath);
+
+        if (result.success) {
+            wchar_t msg[512];
+            swprintf_s(msg, L"[FencesWidget] ✓ File restored to desktop: %s\n", result.newPath.c_str());
+            OutputDebugStringW(msg);
+        } else {
+            wchar_t msg[512];
+            swprintf_s(msg, L"[FencesWidget] ✗ Failed to restore file: %s (Error: %s)\n",
+                       filePath.c_str(), result.errorMessage.c_str());
+            OutputDebugStringW(msg);
+        }
+    } else {
+        // Legacy path: just remove from managed set
+        managedIconPaths_.erase(filePath);
+
+        if (desktopListView_) {
+            InvalidateRect(desktopListView_, nullptr, TRUE);
+        }
+    }
+
     ArrangeIcons(fence);
     InvalidateRect(fence->hwnd, nullptr, TRUE);
+
+    OutputDebugStringW((L"[FencesWidget] Removed icon from fence: " + filePath + L"\n").c_str());
     return true;
 }
 
@@ -2893,159 +3042,16 @@ int FencesWidget::FindDesktopIconIndex(const std::wstring& filePath) {
     return -1;
 }
 
-bool FencesWidget::HideDesktopIcon(const std::wstring& filePath) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView) {
-        return false;
-    }
-
-    int iconIndex = FindDesktopIconIndex(filePath);
-    if (iconIndex < 0) {
-        return false;
-    }
-
-    // Hide the item by removing it from view (not actually deleting it)
-    // We use LVM_SETITEMPOSITION to move it far off-screen
-    POINT offScreen = { -10000, -10000 };
-    SendMessageW(hListView, LVM_SETITEMPOSITION, iconIndex, MAKELPARAM(offScreen.x, offScreen.y));
-
-    // Refresh the desktop
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-
-    return true;
-}
-
-bool FencesWidget::ShowDesktopIcon(const std::wstring& filePath) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView) {
-        return false;
-    }
-
-    int iconIndex = FindDesktopIconIndex(filePath);
-    if (iconIndex < 0) {
-        return false;
-    }
-
-    // Restore the item to its auto-arranged position
-    // Tell Windows to auto-arrange the icons
-    SendMessageW(hListView, LVM_ARRANGE, LVA_DEFAULT, 0);
-
-    // Refresh the desktop
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-
-    return true;
-}
-
-bool FencesWidget::ShowDesktopIconAtPosition(const std::wstring& filePath, int x, int y) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView) {
-        return false;
-    }
-
-    int iconIndex = FindDesktopIconIndex(filePath);
-    if (iconIndex < 0) {
-        return false;
-    }
-
-    // 將螢幕座標轉換為桌面ListView座標
-    POINT pt = { x, y };
-    ScreenToClient(hListView, &pt);
-
-    // 設定圖示位置到指定座標
-    SendMessageW(hListView, LVM_SETITEMPOSITION, iconIndex, MAKELPARAM(pt.x, pt.y));
-
-    // 重新整理桌面
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-
-    return true;
-}
-
-// 批次隱藏桌面圖示（避免多次重繪）
-void FencesWidget::HideDesktopIconsBatch(const std::vector<std::wstring>& filePaths) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView || filePaths.empty()) {
-        return;
-    }
-
-    // 暫停桌面重繪
-    SendMessageW(hListView, WM_SETREDRAW, FALSE, 0);
-
-    // 批次隱藏所有圖示
-    POINT offScreen = { -10000, -10000 };
-    for (const auto& filePath : filePaths) {
-        int iconIndex = FindDesktopIconIndex(filePath);
-        if (iconIndex >= 0) {
-            SendMessageW(hListView, LVM_SETITEMPOSITION, iconIndex, MAKELPARAM(offScreen.x, offScreen.y));
-        }
-    }
-
-    // 恢復重繪並一次性刷新
-    SendMessageW(hListView, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-}
-
-// 批次顯示桌面圖示（避免多次重繪）
-void FencesWidget::ShowDesktopIconsBatch(const std::vector<std::wstring>& filePaths) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView || filePaths.empty()) {
-        return;
-    }
-
-    // 暫停桌面重繪
-    SendMessageW(hListView, WM_SETREDRAW, FALSE, 0);
-
-    // 批次顯示所有圖示
-    for (const auto& filePath : filePaths) {
-        int iconIndex = FindDesktopIconIndex(filePath);
-        if (iconIndex >= 0) {
-            // 這裡可以恢復到原始位置，或讓系統自動排列
-            SendMessageW(hListView, LVM_ARRANGE, LVA_DEFAULT, 0);
-        }
-    }
-
-    // 恢復重繪並一次性刷新
-    SendMessageW(hListView, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-}
-
-// 批次恢復桌面圖示到指定位置（避免多次重繪）
-void FencesWidget::RestoreDesktopIconsBatch(const std::vector<std::pair<std::wstring, POINT>>& iconData) {
-    HWND hListView = GetDesktopListView();
-    if (!hListView || iconData.empty()) {
-        return;
-    }
-
-    // 暫停桌面重繪
-    SendMessageW(hListView, WM_SETREDRAW, FALSE, 0);
-
-    // 批次恢復所有圖示到原始位置
-    for (const auto& data : iconData) {
-        int iconIndex = FindDesktopIconIndex(data.first);
-        if (iconIndex >= 0) {
-            if (data.second.x >= 0 && data.second.y >= 0) {
-                // 將螢幕座標轉換為桌面ListView座標
-                POINT pt = data.second;
-                ScreenToClient(hListView, &pt);
-
-                // 設定圖示位置到指定座標
-                SendMessageW(hListView, LVM_SETITEMPOSITION, iconIndex, MAKELPARAM(pt.x, pt.y));
-            } else {
-                // 如果沒有原始位置，讓系統自動排列
-                SendMessageW(hListView, LVM_ARRANGE, LVA_DEFAULT, 0);
-            }
-        }
-    }
-
-    // 恢復重繪並一次性刷新
-    SendMessageW(hListView, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(hListView, nullptr, TRUE);
-    UpdateWindow(hListView);
-}
+// ============================================================================
+// DEPRECATED METHODS REMOVED IN v3.0
+// The following methods have been replaced by Custom Draw rendering suppression:
+// - HideDesktopIcon() → managedIconPaths_.insert()
+// - ShowDesktopIcon() → managedIconPaths_.erase()
+// - ShowDesktopIconAtPosition() → managedIconPaths_.erase()
+// - HideDesktopIconsBatch() → batch insert to managedIconPaths_
+// - ShowDesktopIconsBatch() → batch erase from managedIconPaths_
+// - RestoreDesktopIconsBatch() → managedIconPaths_.clear()
+// ============================================================================
 
 int FencesWidget::FindIconAtPosition(Fence* fence, int x, int y) {
     if (!fence) {
@@ -3178,6 +3184,414 @@ void FencesWidget::ShowIconContextMenu(Fence* fence, int iconIndex, int x, int y
 
     if (comInitialized) {
         CoUninitialize();
+    }
+}
+
+// ============================================================================
+// Phase 1: ListView Subclassing & Custom Draw Implementation (NEW in v3.0)
+// ============================================================================
+
+bool FencesWidget::SetupDesktopSubclass() {
+    // Find desktop ListView window
+    desktopListView_ = FindDesktopListView();
+    if (!desktopListView_) {
+        OutputDebugStringW(L"[FencesWidget] Failed to find desktop ListView\n");
+        return false;
+    }
+
+    // =========================================================================
+    // FIX: Get parent window (SHELLDLL_DefView) to receive WM_NOTIFY
+    // Custom Draw notifications are sent to the parent, not the ListView itself
+    // =========================================================================
+    desktopShellView_ = GetParent(desktopListView_);
+    if (!desktopShellView_) {
+        OutputDebugStringW(L"[FencesWidget] Failed to get ShellView parent\n");
+        return false;
+    }
+
+    // Debug output
+    wchar_t debugMsg[256];
+    swprintf_s(debugMsg, L"[FencesWidget] ListView=0x%p, ShellView=0x%p\n",
+               desktopListView_, desktopShellView_);
+    OutputDebugStringW(debugMsg);
+
+    // Subclass the ShellView parent (NOT the ListView)
+    BOOL result = SetWindowSubclass(
+        desktopShellView_,  // ← Changed: subclass parent, not ListView
+        ListViewSubclassProc,
+        DESKTOP_SUBCLASS_ID,
+        reinterpret_cast<DWORD_PTR>(this)
+    );
+
+    if (result) {
+        OutputDebugStringW(L"[FencesWidget] Successfully subclassed ShellView parent\n");
+        return true;
+    }
+
+    // SetWindowSubclass failed - try alternative method
+    DWORD lastError = GetLastError();
+    wchar_t errorMsg[256];
+    swprintf_s(errorMsg, L"[FencesWidget] SetWindowSubclass failed with error: %d\n", lastError);
+    OutputDebugStringW(errorMsg);
+
+    // BACKUP PLAN: Use SetWindowLongPtr instead
+    OutputDebugStringW(L"[FencesWidget] Trying backup method: SetWindowLongPtr...\n");
+
+    // Store original WndProc
+    LONG_PTR originalProc = SetWindowLongPtrW(desktopShellView_, GWLP_WNDPROC,
+                                               reinterpret_cast<LONG_PTR>(ListViewSubclassProcLegacy));
+
+    if (originalProc == 0) {
+        DWORD error = GetLastError();
+        swprintf_s(errorMsg, L"[FencesWidget] SetWindowLongPtr also failed with error: %d\n", error);
+        OutputDebugStringW(errorMsg);
+        return false;
+    }
+
+    // Store original proc and instance pointer in window data
+    SetWindowLongPtrW(desktopShellView_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    originalShellViewProc_ = reinterpret_cast<WNDPROC>(originalProc);
+
+    OutputDebugStringW(L"[FencesWidget] Successfully subclassed using SetWindowLongPtr (legacy method)\n");
+    return true;
+}
+
+void FencesWidget::RemoveDesktopSubclass() {
+    if (desktopShellView_) {
+        if (originalShellViewProc_) {
+            // Legacy method: restore original WndProc
+            SetWindowLongPtrW(desktopShellView_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(originalShellViewProc_));
+            SetWindowLongPtrW(desktopShellView_, GWLP_USERDATA, 0);
+            originalShellViewProc_ = nullptr;
+            OutputDebugStringW(L"[FencesWidget] Removed legacy ShellView subclass\n");
+        } else {
+            // Modern method: remove SetWindowSubclass
+            RemoveWindowSubclass(desktopShellView_, ListViewSubclassProc, DESKTOP_SUBCLASS_ID);
+            OutputDebugStringW(L"[FencesWidget] Removed ShellView subclass\n");
+        }
+        desktopShellView_ = nullptr;
+    }
+    desktopListView_ = nullptr;
+}
+
+HWND FencesWidget::FindDesktopListView() {
+    // Method 1: Try Progman window
+    HWND hwndProgman = FindWindowW(L"Progman", nullptr);
+    if (hwndProgman) {
+        HWND hwndShellView = FindWindowExW(hwndProgman, nullptr, L"SHELLDLL_DefView", nullptr);
+        if (hwndShellView) {
+            HWND hwndListView = FindWindowExW(hwndShellView, nullptr, L"SysListView32", nullptr);
+            if (hwndListView) {
+                return hwndListView;
+            }
+        }
+    }
+
+    // Method 2: Try WorkerW windows (Windows 10/11)
+    HWND hwndShellView = nullptr;
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        wchar_t className[256];
+        GetClassNameW(hwnd, className, 256);
+
+        if (wcscmp(className, L"WorkerW") == 0) {
+            HWND hwndDefView = FindWindowExW(hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
+            if (hwndDefView) {
+                *reinterpret_cast<HWND*>(lParam) = hwndDefView;
+                return FALSE;  // Stop enumeration
+            }
+        }
+        return TRUE;  // Continue enumeration
+    }, reinterpret_cast<LPARAM>(&hwndShellView));
+
+    if (hwndShellView) {
+        HWND hwndListView = FindWindowExW(hwndShellView, nullptr, L"SysListView32", nullptr);
+        if (hwndListView) {
+            return hwndListView;
+        }
+    }
+
+    return nullptr;
+}
+
+// Legacy subclass proc (using SetWindowLongPtr instead of SetWindowSubclass)
+LRESULT CALLBACK FencesWidget::ListViewSubclassProcLegacy(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    // Get instance pointer from GWLP_USERDATA
+    FencesWidget* pThis = reinterpret_cast<FencesWidget*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    if (pThis) {
+        // Debug: Log first WM_NOTIFY to confirm subclass is working
+        static bool loggedFirstNotify = false;
+        if (msg == WM_NOTIFY && !loggedFirstNotify) {
+            OutputDebugStringW(L"[Subclass:Legacy] First WM_NOTIFY received - subclass is working!\n");
+            loggedFirstNotify = true;
+        }
+
+        // Intercept WM_NOTIFY for Custom Draw
+        if (msg == WM_NOTIFY) {
+            NMHDR* pNMHDR = reinterpret_cast<NMHDR*>(lParam);
+
+            // Debug: Log notification details
+            static int notifyCount = 0;
+            if (notifyCount < 5) {
+                wchar_t debugMsg[256];
+                swprintf_s(debugMsg, L"[Subclass:Legacy] WM_NOTIFY code=%d, hwndFrom=0x%p (expected 0x%p)\n",
+                           pNMHDR->code, pNMHDR->hwndFrom, pThis->desktopListView_);
+                OutputDebugStringW(debugMsg);
+                notifyCount++;
+            }
+
+            if (pNMHDR->hwndFrom == pThis->desktopListView_ &&
+                pNMHDR->code == NM_CUSTOMDRAW) {
+
+                NMLVCUSTOMDRAW* pCD = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+
+                // Debug: First time Custom Draw notification
+                static bool firstTime = true;
+                if (firstTime) {
+                    OutputDebugStringW(L"[Subclass:Legacy] ✓✓✓ Custom Draw notification MATCHED! ✓✓✓\n");
+                    firstTime = false;
+                }
+
+                return pThis->OnCustomDraw(pCD);
+            }
+        }
+    }
+
+    // Call original WndProc
+    if (pThis && pThis->originalShellViewProc_) {
+        return CallWindowProcW(pThis->originalShellViewProc_, hwnd, msg, wParam, lParam);
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK FencesWidget::ListViewSubclassProc(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR /*uIdSubclass*/, DWORD_PTR dwRefData)
+{
+    FencesWidget* pThis = reinterpret_cast<FencesWidget*>(dwRefData);
+
+    // Debug: Log first WM_NOTIFY to confirm subclass is working
+    static bool loggedFirstNotify = false;
+    if (msg == WM_NOTIFY && !loggedFirstNotify) {
+        OutputDebugStringW(L"[Subclass] First WM_NOTIFY received - subclass is working!\n");
+        loggedFirstNotify = true;
+    }
+
+    // Intercept WM_NOTIFY for Custom Draw
+    if (msg == WM_NOTIFY) {
+        NMHDR* pNMHDR = reinterpret_cast<NMHDR*>(lParam);
+
+        // Debug: Log notification details
+        static int notifyCount = 0;
+        if (notifyCount < 5) {
+            wchar_t debugMsg[256];
+            swprintf_s(debugMsg, L"[Subclass] WM_NOTIFY code=%d, hwndFrom=0x%p (expected 0x%p)\n",
+                       pNMHDR->code, pNMHDR->hwndFrom, pThis->desktopListView_);
+            OutputDebugStringW(debugMsg);
+            notifyCount++;
+        }
+
+        // =====================================================================
+        // FIX: Verify notification is from our ListView
+        // Parent windows can receive notifications from multiple children
+        // =====================================================================
+        if (pNMHDR->hwndFrom == pThis->desktopListView_ &&
+            pNMHDR->code == NM_CUSTOMDRAW) {
+
+            NMLVCUSTOMDRAW* pCD = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+
+            // Debug: First time Custom Draw notification
+            static bool firstTime = true;
+            if (firstTime) {
+                OutputDebugStringW(L"[Subclass] ✓✓✓ Custom Draw notification MATCHED! ✓✓✓\n");
+                firstTime = false;
+            }
+
+            return pThis->OnCustomDraw(pCD);
+        }
+    }
+
+    // Call default subclass procedure for other messages
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+LRESULT FencesWidget::OnCustomDraw(NMLVCUSTOMDRAW* pCD) {
+    // Request notification for each item
+    if (pCD->nmcd.dwDrawStage == CDDS_PREPAINT) {
+        static int prepaintCount = 0;
+        if (prepaintCount < 3) {
+            OutputDebugStringW(L"[CustomDraw] CDDS_PREPAINT - requesting item notifications\n");
+            prepaintCount++;
+        }
+        return CDRF_NOTIFYITEMDRAW;
+    }
+
+    // Check each item before drawing
+    if (pCD->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+        int itemIndex = static_cast<int>(pCD->nmcd.dwItemSpec);
+
+        // Get the full path of this desktop item
+        std::wstring itemPath = GetDesktopItemPath(itemIndex);
+
+        // Debug output for EVERY item (temporarily)
+        static int debugCount = 0;
+        if (debugCount < 20) {  // Only first 20 items to avoid spam
+            wchar_t msg[512];
+            swprintf_s(msg, L"[CustomDraw] Item %d: %s (managed=%d)\n",
+                       itemIndex,
+                       itemPath.empty() ? L"<empty>" : itemPath.c_str(),
+                       IsIconManagedByFence(itemPath));
+            OutputDebugStringW(msg);
+            debugCount++;
+        }
+
+        // If this icon is managed by a fence, skip default drawing
+        if (!itemPath.empty() && IsIconManagedByFence(itemPath)) {
+            // Debug output for first skip
+            static int skipCount = 0;
+            if (skipCount < 3) {
+                OutputDebugStringW((L"[FencesWidget] ✓ SKIP rendering: " + itemPath + L"\n").c_str());
+                skipCount++;
+            }
+
+            // This is the key: tell Explorer NOT to draw this icon
+            return CDRF_SKIPDEFAULT;
+        }
+    }
+
+    // Let Explorer draw other icons normally
+    return CDRF_DODEFAULT;
+}
+
+std::wstring FencesWidget::GetDesktopItemPath(int itemIndex) {
+    if (!desktopListView_ || itemIndex < 0) {
+        return L"";
+    }
+
+    // Get item text (filename)
+    wchar_t buffer[MAX_PATH] = {0};
+    LVITEMW item = {0};
+    item.mask = LVIF_TEXT;
+    item.iItem = itemIndex;
+    item.pszText = buffer;
+    item.cchTextMax = MAX_PATH;
+
+    if (!SendMessageW(desktopListView_, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))) {
+        return L"";
+    }
+
+    // Get desktop path
+    wchar_t desktopPath[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktopPath))) {
+        return L"";
+    }
+
+    // Combine to full path
+    std::wstring fullPath = std::wstring(desktopPath) + L"\\" + buffer;
+
+    // Check if file exists (might be from Public Desktop)
+    if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        // Try Public Desktop
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_DESKTOPDIRECTORY, nullptr, 0, desktopPath))) {
+            fullPath = std::wstring(desktopPath) + L"\\" + buffer;
+        }
+    }
+
+    return fullPath;
+}
+
+bool FencesWidget::IsIconManagedByFence(const std::wstring& path) {
+    // O(1) lookup in unordered_set
+    return managedIconPaths_.find(path) != managedIconPaths_.end();
+}
+
+// ============================================================================
+// Shell Notification Handlers (NEW in v3.0)
+// ============================================================================
+
+void FencesWidget::OnDesktopItemCreated(const std::wstring& path) {
+    // Check if this file should be auto-categorized
+    std::wstring category = GetFileCategory(path);
+
+    // Find fence with matching title
+    Fence* targetFence = nullptr;
+    for (auto& fence : fences_) {
+        if (fence.title == category) {
+            targetFence = &fence;
+            break;
+        }
+    }
+
+    // If auto-categorization is enabled and fence exists, add icon
+    if (targetFence) {
+        AddIconToFence(targetFence, path);
+        OutputDebugStringW((L"[FencesWidget] Auto-categorized: " + path + L"\n").c_str());
+    }
+}
+
+void FencesWidget::OnDesktopItemDeleted(const std::wstring& path) {
+    // Remove from all fences
+    for (auto& fence : fences_) {
+        auto it = std::find_if(fence.icons.begin(), fence.icons.end(),
+            [&](const DesktopIcon& icon) { return icon.filePath == path; });
+
+        if (it != fence.icons.end()) {
+            // Clean up icon handles
+            if (it->hIcon32) DestroyIcon(it->hIcon32);
+            if (it->hIcon48) DestroyIcon(it->hIcon48);
+            if (it->hIcon64) DestroyIcon(it->hIcon64);
+            if (it->hIcon) DestroyIcon(it->hIcon);
+
+            fence.icons.erase(it);
+            managedIconPaths_.erase(path);
+
+            // Rearrange and redraw
+            ArrangeIcons(&fence);
+            InvalidateRect(fence.hwnd, nullptr, TRUE);
+
+            OutputDebugStringW((L"[FencesWidget] Removed deleted icon: " + path + L"\n").c_str());
+            break;
+        }
+    }
+}
+
+void FencesWidget::OnDesktopItemRenamed(const std::wstring& oldPath, const std::wstring& newPath) {
+    // Update in all fences
+    for (auto& fence : fences_) {
+        auto it = std::find_if(fence.icons.begin(), fence.icons.end(),
+            [&](const DesktopIcon& icon) { return icon.filePath == oldPath; });
+
+        if (it != fence.icons.end()) {
+            // Update file path
+            it->filePath = newPath;
+
+            // Update display name
+            size_t lastSlash = newPath.find_last_of(L"\\/");
+            if (lastSlash != std::wstring::npos) {
+                it->displayName = newPath.substr(lastSlash + 1);
+            } else {
+                it->displayName = newPath;
+            }
+
+            // Remove extension
+            size_t lastDot = it->displayName.find_last_of(L'.');
+            if (lastDot != std::wstring::npos && lastDot > 0) {
+                it->displayName = it->displayName.substr(0, lastDot);
+            }
+
+            // Update managed paths
+            managedIconPaths_.erase(oldPath);
+            managedIconPaths_.insert(newPath);
+
+            // Redraw fence
+            InvalidateRect(fence.hwnd, nullptr, TRUE);
+
+            OutputDebugStringW((L"[FencesWidget] Renamed: " + oldPath + L" -> " + newPath + L"\n").c_str());
+            break;
+        }
     }
 }
 
