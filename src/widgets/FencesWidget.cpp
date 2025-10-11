@@ -175,6 +175,50 @@ bool FencesWidget::Start() {
     }
 
     // =========================================================================
+    // NEW in v4.0: Move desktop files to managed folder on startup
+    // =========================================================================
+    if (fileManager_) {
+        for (auto& fence : fences_) {
+            for (auto& icon : fence.icons) {
+                // 檢查文件是否在桌面（從配置加載的是桌面路徑）
+                if (FileManager::IsDesktopFile(icon.filePath) &&
+                    GetFileAttributesW(icon.filePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    // 移動到管理文件夾
+                    MoveResult result = fileManager_->MoveToManagedFolder(icon.filePath, fence.title);
+                    if (result.success) {
+                        wchar_t msg[512];
+                        swprintf_s(msg, L"[FencesWidget] Start: Moved to managed folder: %s\n", result.newPath.c_str());
+                        OutputDebugStringW(msg);
+                        // 更新圖標路徑為管理路徑
+                        icon.filePath = result.newPath;
+
+                        // 清除舊的圖標緩存，強制重新加載
+                        if (icon.hIcon) {
+                            DestroyIcon(icon.hIcon);
+                            icon.hIcon = nullptr;
+                        }
+                        if (icon.hIcon32) {
+                            DestroyIcon(icon.hIcon32);
+                            icon.hIcon32 = nullptr;
+                        }
+                        if (icon.hIcon48) {
+                            DestroyIcon(icon.hIcon48);
+                            icon.hIcon48 = nullptr;
+                        }
+                        if (icon.hIcon64) {
+                            DestroyIcon(icon.hIcon64);
+                            icon.hIcon64 = nullptr;
+                        }
+                    }
+                }
+            }
+            // 重新排列圖標並刷新顯示
+            ArrangeIcons(&fence);
+            InvalidateRect(fence.hwnd, nullptr, TRUE);
+        }
+    }
+
+    // =========================================================================
     // NEW in v3.0: Rebuild managedIconPaths and trigger desktop redraw
     // =========================================================================
     managedIconPaths_.clear();
@@ -715,7 +759,25 @@ void FencesWidget::Shutdown() {
     }
     shutdownCalled_ = true;
 
-    // 保存配置（在清空之前）
+    // NEW in v4.0: Move all managed files back to desktop and update paths BEFORE saving
+    if (fileManager_) {
+        for (auto& fence : fences_) {
+            for (auto& icon : fence.icons) {
+                if (fileManager_->IsManagedFile(icon.filePath)) {
+                    MoveResult result = fileManager_->MoveBackToDesktop(icon.filePath);
+                    if (result.success) {
+                        wchar_t msg[512];
+                        swprintf_s(msg, L"[FencesWidget] Shutdown: File restored to desktop: %s\n", result.newPath.c_str());
+                        OutputDebugStringW(msg);
+                        // 更新為桌面路徑，這樣配置保存的是桌面路徑
+                        icon.filePath = result.newPath;
+                    }
+                }
+            }
+        }
+    }
+
+    // 保存配置（在清理之前，現在 icon.filePath 已經是桌面路徑）
     wchar_t appData[MAX_PATH];
     if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData) == S_OK) {
         std::wstring configPath = std::wstring(appData) + L"\\FencesWidget\\config.json";
@@ -740,22 +802,6 @@ void FencesWidget::Shutdown() {
     if (desktopEnumerator_) {
         delete desktopEnumerator_;
         desktopEnumerator_ = nullptr;
-    }
-
-    // NEW in v4.0: Move all managed files back to desktop before shutdown
-    if (fileManager_) {
-        for (auto& fence : fences_) {
-            for (const auto& icon : fence.icons) {
-                if (fileManager_->IsManagedFile(icon.filePath)) {
-                    MoveResult result = fileManager_->MoveBackToDesktop(icon.filePath);
-                    if (result.success) {
-                        wchar_t msg[512];
-                        swprintf_s(msg, L"[FencesWidget] Shutdown: File restored to desktop: %s\n", result.newPath.c_str());
-                        OutputDebugStringW(msg);
-                    }
-                }
-            }
-        }
     }
 
     // NEW in v4.0: Clean up file manager
