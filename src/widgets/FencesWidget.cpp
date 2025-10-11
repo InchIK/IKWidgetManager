@@ -716,17 +716,12 @@ bool FencesWidget::LoadConfiguration(const std::wstring& filePath) {
                 newIcon.selected = false;
                 newIcon.position = { 0, 0 };
 
-                // 提取顯示名稱
+                // 提取顯示名稱（保留副檔名，與桌面一致）
                 size_t lastSlash = iconPath.find_last_of(L"\\/");
                 if (lastSlash != std::wstring::npos) {
                     newIcon.displayName = iconPath.substr(lastSlash + 1);
                 } else {
                     newIcon.displayName = iconPath;
-                }
-
-                size_t lastDot = newIcon.displayName.find_last_of(L'.');
-                if (lastDot != std::wstring::npos && lastDot > 0) {
-                    newIcon.displayName = newIcon.displayName.substr(0, lastDot);
                 }
 
                 fence->icons.push_back(newIcon);
@@ -2577,18 +2572,12 @@ bool FencesWidget::AddIconToFence(Fence* fence, const std::wstring& filePath) {
     newIcon.selected = false;
     newIcon.position = { 0, 0 }; // Will be set by ArrangeIcons
 
-    // Extract display name
+    // Extract display name（保留副檔名，與桌面一致）
     size_t lastSlash = filePath.find_last_of(L"\\/");
     if (lastSlash != std::wstring::npos) {
         newIcon.displayName = filePath.substr(lastSlash + 1);
     } else {
         newIcon.displayName = filePath;
-    }
-
-    // Remove file extension for display
-    size_t lastDot = newIcon.displayName.find_last_of(L'.');
-    if (lastDot != std::wstring::npos && lastDot > 0) {
-        newIcon.displayName = newIcon.displayName.substr(0, lastDot);
     }
 
     fence->icons.push_back(newIcon);
@@ -3614,18 +3603,12 @@ void FencesWidget::OnDesktopItemRenamed(const std::wstring& oldPath, const std::
             // Update file path
             it->filePath = newPath;
 
-            // Update display name
+            // Update display name（保留副檔名，與桌面一致）
             size_t lastSlash = newPath.find_last_of(L"\\/");
             if (lastSlash != std::wstring::npos) {
                 it->displayName = newPath.substr(lastSlash + 1);
             } else {
                 it->displayName = newPath;
-            }
-
-            // Remove extension
-            size_t lastDot = it->displayName.find_last_of(L'.');
-            if (lastDot != std::wstring::npos && lastDot > 0) {
-                it->displayName = it->displayName.substr(0, lastDot);
             }
 
             // Update managed paths
